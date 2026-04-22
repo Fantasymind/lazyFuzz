@@ -1,0 +1,5 @@
+./smartfuzzer -list targets.txt -wordlist words.txt -c 2000 -rps 500 -o results.json
+
+./smartfuzzer -list targets.txt -wordlist words.txt -c 1500 -rps 300 -o results.json
+
+go build -o smartfuzzer main.go
