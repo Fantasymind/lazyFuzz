@@ -29,6 +29,29 @@ import (
 
 const Version = "lazyFuzz v4.4.0"
 
+// randomUserAgents is a pool of real browser User-Agent strings.
+var randomUserAgents = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0",
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (X11; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:125.0) Gecko/20100101 Firefox/125.0",
+	"Mozilla/5.0 (iPhone; CPU iPhone OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.6367.82 Mobile Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 OPR/109.0.0.0",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 6.1; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
+	"Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:125.0) Gecko/20100101 Firefox/125.0",
+	"Mozilla/5.0 (iPad; CPU OS 17_4_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Mobile/15E148 Safari/604.1",
+	"Mozilla/5.0 (Windows NT 10.0; WOW64; Trident/7.0; rv:11.0) like Gecko",
+}
+
+func randomUA() string {
+	return randomUserAgents[rand.Intn(len(randomUserAgents))]
+}
+
 // ============================================================
 // Custom flag types
 // ============================================================
@@ -186,9 +209,11 @@ type FuzzConfig struct {
 	totalReqs  int64
 	total403   int64
 	stopFlag   int32
+	urlIndex   int64      // current URL index for checkpoint log
 	resultsMu  sync.Mutex
-	results    []JSONRecord // collected for file output
-	debugLog   *os.File    // debug log file handle
+	results    []JSONRecord
+	debugLog   *os.File
+	RandomUA   bool       // -rua
 }
 
 // JSONRecord is emitted per result when -json is active
@@ -418,11 +443,9 @@ func printBanner() {
 	cyan   := "\033[36m"
 	yellow := "\033[33m"
 	reset  := "\033[0m"
-	dim    := "\033[2m"
 
 	fmt.Println(cyan + banner + reset)
-	fmt.Printf("\n  %s%s%s  %s~ Fuzz Faster, You Fool ~%s\n\n",
-		yellow, Version, reset, dim, reset)
+	fmt.Printf("\n  %s%s%s\n\n", yellow, Version, reset)
 }
 
 func printHelp() {
@@ -492,6 +515,7 @@ func printHelp() {
 	opt("-sf",                  "Stop when >95% of responses return 403 (default: false)")
 	opt("-t <n>",               "Number of concurrent threads (default: 40)")
 	opt("-v",                   "Verbose output — print full URL and redirect location (default: false)")
+	opt("-rua",                 "Random User-Agent browser tiap request (default: false)")
 	fmt.Println()
 
 	section("MATCHER OPTIONS")
@@ -630,6 +654,7 @@ func main() {
 	stop403        := flag.Bool("sf", false, "Stop bila >95% response 403 Forbidden (default: false)")
 	threadPtr      := flag.Int("t", 40, "Jumlah concurrent threads (default: 40)")
 	verbose        := flag.Bool("v", false, "Verbose output, print full URL dan redirect location (default: false)")
+	ruaPtr         := flag.Bool("rua", false, "Gunakan random User-Agent browser tiap request (default: false)")
 
 	// --- MATCHER OPTIONS ---
 	mcPtr    := flag.String("mc", "200-299,301,302,307,401,403,405,500",
@@ -919,8 +944,13 @@ func main() {
 	} else if *targetURL != "" {
 		urls = []string{*targetURL}
 	} else {
+		// -l supports "file.txt" or "file.txt:KEYWORD" (keyword used as template var in -H etc)
+		listFile := *listPtr
+		if idx := strings.LastIndex(listFile, ":"); idx > 1 {
+			listFile = (*listPtr)[:idx]
+		}
 		var err error
-		urls, err = readLines(*listPtr)
+		urls, err = readLinesFiltered(listFile, false)
 		if err != nil {
 			fmt.Printf("[-] Gagal baca file list: %v\n", err)
 			return
@@ -1112,6 +1142,7 @@ func main() {
 		OutputOnlyResults: *outputOnlyR,
 		DebugLogFile:      *debugLogPtr,
 		debugLog:          debugLogFile,
+		RandomUA:          *ruaPtr,
 		startTime:         time.Now(),
 	}
 	_ = rawReqMethod  // used above
@@ -1196,7 +1227,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for target := range jobs {
+			for job := range jobs {
 				if atomic.LoadInt32(&cfg.stopFlag) == 1 {
 					continue
 				}
@@ -1216,37 +1247,57 @@ func main() {
 				if cfg.Delay != "" {
 					sleepDelay(cfg.Delay)
 				}
-				fuzz(client, target, cfg, 0)
+				// Unpack target and baseURL
+				parts := strings.SplitN(job, "\x00", 2)
+				target := parts[0]
+				baseURL := target
+				if len(parts) == 2 {
+					baseURL = parts[1]
+				}
+				fuzz(client, target, baseURL, cfg, 0)
 			}
 		}()
 	}
 
 	// --- URL generator goroutine ---
 	done := make(chan struct{})
+	totalURLs := len(urls)
 	go func() {
 		defer close(done)
-		for _, u := range urls {
+		for urlIdx, u := range urls {
 			if atomic.LoadInt32(&cfg.stopFlag) == 1 {
 				break
 			}
+
+			// Checkpoint log: progress per URL
+			if !cfg.Silent {
+				pct := float64(urlIdx+1) / float64(totalURLs) * 100
+				fmt.Printf("\r\033[36m[checkpoint]\033[0m URL %d/%d (%.1f%%) → %s\033[K",
+					urlIdx+1, totalURLs, pct, u)
+			}
+			atomic.StoreInt64(&cfg.urlIndex, int64(urlIdx+1))
+
 			for _, combo := range inputCombos {
 				if atomic.LoadInt32(&cfg.stopFlag) == 1 {
 					break
 				}
-				// Substitute all keywords in URL
+				// Substitute FUZZ keyword in URL
 				target := substituteKeywords(u, combo, cfg)
 				// If no keyword in URL, append first wordlist value as path
 				if target == u && len(combo) > 0 {
-					for kw, val := range combo {
-						_ = kw
+					for _, val := range combo {
 						target = strings.TrimRight(u, "/") + "/" + strings.TrimLeft(val, "/")
 						break
 					}
 				}
-				jobs <- target
+				// Pass current base URL for dynamic header substitution (Referer etc.)
+				jobs <- target + "\x00" + u
 			}
 		}
 		close(jobs)
+		if !cfg.Silent {
+			fmt.Println() // newline after checkpoint
+		}
 	}()
 
 	// --- Watch global timer ---
@@ -1281,9 +1332,12 @@ func main() {
 // fuzz - core request function
 // ============================================================
 
-func fuzz(client *http.Client, fullURL string, cfg *FuzzConfig, depth int) {
+func fuzz(client *http.Client, fullURL string, baseURL string, cfg *FuzzConfig, depth int) {
 	if !strings.HasPrefix(fullURL, "http") {
 		fullURL = "http://" + fullURL
+	}
+	if baseURL == "" {
+		baseURL = fullURL
 	}
 
 	var bodyReader io.Reader
@@ -1297,12 +1351,33 @@ func fuzz(client *http.Client, fullURL string, cfg *FuzzConfig, depth int) {
 		return
 	}
 
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) lazyFuzz/4.2")
+	// User-Agent: random or default
+	if cfg.RandomUA {
+		req.Header.Set("User-Agent", randomUA())
+	} else {
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) lazyFuzz/4.4")
+	}
 
+	// Parse the fuzz path for header substitution (e.g. /FUZZ value)
+	parsedTarget, _ := url.Parse(fullURL)
+	fuzzPath := ""
+	if parsedTarget != nil {
+		fuzzPath = parsedTarget.Path
+	}
+
+	// Custom headers — support dynamic substitutions:
+	//   URL      → current base URL from -l list
+	//   /FUZZ    → path component of current fuzzed URL
 	for _, h := range cfg.Headers {
 		parts := strings.SplitN(h, ":", 2)
 		if len(parts) == 2 {
-			req.Header.Set(strings.TrimSpace(parts[0]), strings.TrimSpace(parts[1]))
+			k := strings.TrimSpace(parts[0])
+			v := strings.TrimSpace(parts[1])
+			// Substitute dynamic placeholders in header values
+			v = strings.ReplaceAll(v, "URL", baseURL)
+			v = strings.ReplaceAll(v, "/FUZZ", fuzzPath)
+			v = strings.ReplaceAll(v, "FUZZ", fuzzPath)
+			req.Header.Set(k, v)
 		}
 	}
 
@@ -1443,6 +1518,7 @@ func fuzz(client *http.Client, fullURL string, cfg *FuzzConfig, depth int) {
 			if !cfg.Silent {
 				fmt.Printf("  \033[36m[>] Rekursi: %s (depth %d)\033[0m\n", subURL, depth+1)
 			}
+			fuzz(client, subURL, baseURL, cfg, depth+1)
 		}
 	}
 }
